@@ -1475,8 +1475,9 @@ class TestHostAutofocus(unittest.IsolatedAsyncioTestCase):
 class TestCameraGeometry(unittest.IsolatedAsyncioTestCase):
   def test_mismatched_calibrated_geometry_is_rejected(self):
     celigo = make_celigo()
-    celigo.camera.width = 2464
-    celigo.camera.height = 2056
+    camera = celigo._require_camera()
+    camera.width = 2464
+    camera.height = 2056
     celigo.config.calibration = make_calibration_config(
       image_width_pixels=2048,
       image_height_pixels=2048,
@@ -1500,7 +1501,7 @@ class TestCameraGeometry(unittest.IsolatedAsyncioTestCase):
       image_height_pixels=4,
     )
     with patch.object(celigo, "camera", camera):
-      frame = await celigo.camera.capture(flush_frames=0)
+      frame = await camera.capture(flush_frames=0)
       self.assertEqual((frame.width, frame.height), (5, 5))
       with self.assertRaisesRegex(CeligoError, "does not match calibrated"):
         await celigo.capture_frame(flush_frames=0)

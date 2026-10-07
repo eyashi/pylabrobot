@@ -763,9 +763,19 @@ class LinearAxis(Axis):
 
     This cannot prove that encoder zero matches the physical datum. Normal workflows
     should call :meth:`home`.
+
+    Positions within the fine-position window of the configured bounds are accepted:
+    every move, including the move to ``MinPosition`` that ends :meth:`home`, settles
+    anywhere within that window of its target.
     """
     position = await self.request_encoder_ticks()
-    self._validate_target(position)
+    minimum_ticks, maximum_ticks = self.encoder_bounds()
+    window = self.config.fine_position_error_window
+    if not minimum_ticks - window <= position <= maximum_ticks + window:
+      raise CeligoError(
+        f"axis {self.name} position {position} is outside configured encoder range "
+        f"{minimum_ticks}..{maximum_ticks} (+/- {window})"
+      )
     await self.motor._set_mode(self._motor_mode())
     self._has_position_reference = True
     return position

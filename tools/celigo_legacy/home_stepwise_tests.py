@@ -24,7 +24,9 @@ class FakeStagePort(FakeControllerPort):
   """
 
   SENSOR_AT = -1000
+  FAR_AT = 3000
   INDEX_PHASE = 37
+  ADDRESS = 2
 
   def __init__(
     self,
@@ -32,6 +34,7 @@ class FakeStagePort(FakeControllerPort):
     has_index: bool = True,
     units_are_ticks: bool = True,
     slack_ticks: float = 0.0,
+    z_ignores_distance: bool = False,
   ) -> None:
     super().__init__(firmware=0x010300)
     self.honor_limits = honor_limits
@@ -40,6 +43,8 @@ class FakeStagePort(FakeControllerPort):
     self.raw = -500.0  # physical position in ticks
     # The encoder trails the commanded position by up to ``slack_ticks`` after a reversal.
     self.slack_ticks = slack_ticks
+    # As on the instrument: with no index, Z keeps going regardless of its distance.
+    self.z_ignores_distance = z_ignores_distance
     self.encoder = self.raw
     self.target = self.raw
     self.offset = 0.0  # set by an index home
@@ -47,9 +52,14 @@ class FakeStagePort(FakeControllerPort):
     self.encoder_ratio = 1000
     self.zero_at_target = False
     self.executed: List[str] = []
+    # Raw ?4 flags reported by the other motors, e.g. {1: 7} for X on its home sensor.
+    self.other_flags: Dict[int, int] = {}
 
   def _sensor(self) -> bool:
     return self.raw <= self.SENSOR_AT
+
+  def _far(self) -> bool:
+    return self.raw >= self.FAR_AT
 
   def _units_per_tick(self) -> float:
     return 1.0 if self.units_are_ticks else 256.0
@@ -60,6 +70,9 @@ class FakeStagePort(FakeControllerPort):
       return
     if self.mode & 2 and self.honor_limits and remaining < 0 and self._sensor():
       self.target = self.raw  # limit mode stops at the home sensor
+      return
+    if self.mode & 2 and self.honor_limits and remaining > 0 and self._far():
+      self.target = self.raw  # and at the far sensor
       return
     self.raw += max(-5.0, min(5.0, remaining))
     self.encoder = min(max(self.encoder, self.raw - self.slack_ticks), self.raw + self.slack_ticks)
@@ -88,10 +101,13 @@ class FakeStagePort(FakeControllerPort):
       self.offset = self.encoder = start
       edge = min(start, float(self.SENSOR_AT))
       index = edge - ((edge - self.INDEX_PHASE) % 200)
-      if self.has_index and start - index <= distance:
+      if re.search(_PREFIX + r"N1Z", tokens):
+        # Encoder mode without index: home to the sensor edge and zero there.
+        self.target, self.zero_at_target = edge, True
+      elif self.has_index and start - index <= distance:
         self.target, self.zero_at_target = index, True
       else:
-        self.target = start - distance
+        self.target = start - (1e9 if self.z_ignores_distance else distance)
 
   def _payload(self, opcode: int) -> bytes:
     if opcode != 47:
@@ -100,8 +116,11 @@ class FakeStagePort(FakeControllerPort):
     address = int(chr(request[1]))
     tokens = request[3:-2].decode("ascii")
     status, text = 0x60, ""
-    if address != 2:
-      text = "EZStepper AllMotion V7.21" if tokens == "&" else "0"
+    if address != self.ADDRESS:
+      if tokens == "?4":
+        text = str(self.other_flags.get(address, 3))
+      else:
+        text = "EZStepper AllMotion V7.21" if tokens == "&" else "0"
     elif tokens == "&":
       text = "EZStepper AllMotion V7.21 3-9-10"
     elif tokens == "T":
@@ -115,7 +134,7 @@ class FakeStagePort(FakeControllerPort):
     elif tokens == "?8":
       text = str(round(self.encoder - self.offset))
     elif tokens == "?4":
-      text = str(7 if self._sensor() else 3)
+      text = str(3 | (4 if self._sensor() else 0) | (8 if self._far() else 0))
     elif tokens == "?aE":
       text = str(self.encoder_ratio)
     elif tokens.endswith("R"):
@@ -173,7 +192,7 @@ class HomeStepwiseTests(unittest.TestCase):
     self.assertNotIn("error", report)
     self.assertEqual(set(self.outcomes(report).values()), {"ok"})
     self.assertEqual(report["stages"]["units"]["verdict"], "encoder ticks (matches the driver)")
-    self.assertEqual(report["stages"]["zero"]["position_mm"], 0.0)
+    self.assertAlmostEqual(report["stages"]["zero"]["position_mm"], 1.0, delta=0.02)  # MinPosition
     self.assertEqual(port.offset % 200, FakeStagePort.INDEX_PHASE % 200)
 
   def test_slack_does_not_read_as_a_stall(self):
@@ -211,22 +230,23 @@ class HomeStepwiseTests(unittest.TestCase):
   def test_limit_mode_that_does_not_stop_trips_the_watchdog(self):
     port = FakeStagePort(honor_limits=False)
     report = self.run_home(port)
-    self.assertIn("past the home-sensor edge", report["stages"]["seek"]["outcome"])
+    self.assertIn("past the sensor edge", report["stages"]["seek"]["outcome"])
     self.assertNotIn("backoff", report["stages"])
     self.assertGreater(port.raw, FakeStagePort.SENSOR_AT - 30 - 100)
     self.assertEqual(port.target, port.raw)  # terminated
 
-  def test_missing_index_stops_on_reentering_the_sensor(self):
+  def test_missing_index_is_stopped_past_the_sensor_edge(self):
     port = FakeStagePort(has_index=False)
     report = self.run_home(port)
-    self.assertIn("no encoder index found", report["stages"]["index"]["outcome"])
+    # Z keeps searching past the sensor edge until the watchdog stops it.
+    self.assertIn("past the sensor edge", report["stages"]["index"]["outcome"])
     self.assertNotIn("zero", report["stages"])
 
   def test_driver_home_matches_the_stepwise_result(self):
     port = FakeStagePort()
     report = self.run_home(port, driver_home=True, units_per_tick=1.0)
     self.assertEqual(self.outcomes(report), {"init": "ok", "driver_home": "ok"})
-    self.assertEqual(report["stages"]["driver_home"]["position_mm"], 0.0)
+    self.assertAlmostEqual(report["stages"]["driver_home"]["position_mm"], 1.0, delta=0.02)
 
   def test_guarded_never_cancels_the_watchdog_mid_query(self):
     interrupted: List[bool] = []
@@ -251,6 +271,42 @@ class HomeStepwiseTests(unittest.TestCase):
     )
     self.assertEqual(result, "done")
     self.assertEqual(interrupted, [])
+
+  def test_sensor_edge_home_zeroes_at_the_sensor(self):
+    port = FakeStagePort()
+    report = self.run_home(port, home_type=None)
+    self.assertEqual(report["home_type"], "NormalWithHardstopCheck")
+    self.assertNotIn("error", report)
+    self.assertEqual(report["stages"]["index"]["special_mode"], 1)
+    self.assertEqual(port.offset, FakeStagePort.SENSOR_AT)
+    self.assertAlmostEqual(report["stages"]["zero"]["position_mm"], 1.0, delta=0.02)
+
+  def test_sensor_edge_driver_home(self):
+    port = FakeStagePort()
+    report = self.run_home(port, home_type=None, driver_home=True, units_per_tick=1.0)
+    self.assertEqual(self.outcomes(report), {"init": "ok", "driver_home": "ok"})
+    self.assertEqual(port.offset, FakeStagePort.SENSOR_AT)
+
+  def test_driver_home_from_the_far_sensor(self):
+    port = FakeStagePort()
+    port.raw = port.target = port.encoder = float(FakeStagePort.FAR_AT)  # Y out at the door
+    report = self.run_home(port, home_type=None, driver_home=True, units_per_tick=1.0)
+    self.assertEqual(self.outcomes(report), {"init": "ok", "driver_home": "ok"})
+    self.assertEqual(port.offset, FakeStagePort.SENSOR_AT)
+
+  def test_far_stage_stops_at_the_far_sensor_when_x_is_home(self):
+    port = FakeStagePort()
+    port.other_flags = {1: 7}
+    report = self.run_home(port, home_type=None, through="far")
+    self.assertEqual(report["stages"]["far"]["outcome"], "ok")
+    self.assertGreaterEqual(port.raw, FakeStagePort.FAR_AT)
+    self.assertLess(port.raw, FakeStagePort.FAR_AT + 30)
+
+  def test_far_stage_refuses_y_unless_x_is_at_the_door(self):
+    port = FakeStagePort()
+    report = self.run_home(port, home_type=None, through="far")
+    self.assertIn("door", report["stages"]["far"]["outcome"])
+    self.assertLess(port.raw, FakeStagePort.FAR_AT)
 
   def test_driver_home_requires_measured_units(self):
     with self.assertRaises(SystemExit):

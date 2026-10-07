@@ -151,6 +151,36 @@ class TestMotorReliability(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(driver.x_axis.has_position_reference)
     self.assertEqual(restored_modes, [0])
 
+  async def test_assume_homed_accepts_a_position_settled_within_the_fine_window(self):
+    # Homing ends with a move to MinPosition that may settle anywhere within the window.
+    driver = make_celigo(
+      hardware=CeligoHardwareConfig(
+        x_axis=make_linear_axis_config(
+          axis_index=1,
+          min_position=79,
+          max_position=200,
+          mm_per_encoder_tick=1,
+          fine_position_error_window=10,
+        )
+      )
+    )
+    position = 78
+
+    async def request_encoder_ticks():
+      return position
+
+    async def set_mode(_mode):
+      return None
+
+    with (
+      patch.object(driver.x_axis, "request_encoder_ticks", request_encoder_ticks),
+      patch.object(driver.x_axis.motor, "_set_mode", set_mode),
+    ):
+      self.assertEqual(await driver.x_axis.assume_homed(), 78)
+      position = 68
+      with self.assertRaisesRegex(CeligoError, "outside"):
+        await driver.x_axis.assume_homed()
+
   async def test_invalid_axis_scale_fails_closed_before_io(self):
     driver = make_celigo(
       hardware=CeligoHardwareConfig(
@@ -801,6 +831,96 @@ class TestLifecycleReliability(unittest.IsolatedAsyncioTestCase):
       await celigo.stop()
     self.assertEqual(camera.stop_calls, 1)
     self.assertFalse(camera.is_open)
+
+  async def test_setup_without_camera_initializes_and_homes(self):
+    celigo = make_celigo(camera_enabled=False)
+    io = _LifecycleIO()
+    celigo.config.hardware = CeligoHardwareConfig()
+    steps = []
+
+    async def no_op(*_args, **_kwargs):
+      return None
+
+    async def status():
+      return ControllerStatus(0, 0)
+
+    async def identity():
+      return ControllerInfo(1, (1, 3, 0), 256)
+
+    async def initialize_hardware():
+      steps.append("initialize_hardware")
+
+    async def home():
+      steps.append("home")
+
+    with patch.multiple(
+      celigo,
+      io=io,
+      abort_controller_operation=no_op,
+      request_controller_status=status,
+      request_controller_info=identity,
+      _initialize_hardware=initialize_hardware,
+      _initialize_safe_outputs=no_op,
+      home_imaging_axes=home,
+    ):
+      await celigo.setup()
+      self.assertEqual(steps, ["initialize_hardware", "home"])
+      self.assertTrue(celigo._connected)
+      with self.assertRaisesRegex(CeligoError, "camera_enabled=False"):
+        await celigo.capture_frame()
+      await celigo.stop()
+    self.assertIsNone(celigo.camera)
+    self.assertTrue(io.stopped)
+
+  async def test_setup_without_homing_adopts_linear_axis_positions(self):
+    celigo = make_celigo(
+      camera_enabled=False,
+      hardware=CeligoHardwareConfig(
+        x_axis=make_linear_axis_config(axis_index=1, max_position=10, mm_per_encoder_tick=1),
+        y_axis=make_linear_axis_config(axis_index=2, max_position=10, mm_per_encoder_tick=1),
+      ),
+    )
+    io = _LifecycleIO()
+    homed = []
+    adopted = []
+
+    async def no_op(*_args, **_kwargs):
+      return None
+
+    async def status():
+      return ControllerStatus(0, 0)
+
+    async def identity():
+      return ControllerInfo(1, (1, 3, 0), 256)
+
+    async def home():
+      homed.append(True)
+
+    def adopt(name):
+      async def assume_homed():
+        adopted.append(name)
+        return 0
+
+      return assume_homed
+
+    with (
+      patch.multiple(
+        celigo,
+        io=io,
+        abort_controller_operation=no_op,
+        request_controller_status=status,
+        request_controller_info=identity,
+        _initialize_hardware=no_op,
+        _initialize_safe_outputs=no_op,
+        home_imaging_axes=home,
+      ),
+      patch.object(celigo.x_axis, "assume_homed", adopt("x")),
+      patch.object(celigo.y_axis, "assume_homed", adopt("y")),
+    ):
+      await celigo.setup(home=False)
+    self.assertEqual(homed, [])
+    self.assertEqual(sorted(adopted), ["x", "y"])
+    self.assertTrue(celigo._connected)
 
   async def test_normal_stop_aborts_and_clears_outputs_before_transport_close(self):
     celigo = make_celigo()

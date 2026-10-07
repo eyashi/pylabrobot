@@ -276,6 +276,7 @@ def make_celigo(
   config: Optional[CeligoConfig] = None,
   hardware: Optional[CeligoHardwareConfig] = None,
   allow_laser: bool = False,
+  camera_enabled: bool = True,
 ) -> Celigo:
   """Construct a hardware-free ``Celigo`` for tests."""
   config = make_test_config() if config is None else config
@@ -286,4 +287,4 @@ def make_celigo(
     patch("pylabrobot.revvity.celigo.celigo.FTDI", return_value=object()),
     patch("pylabrobot.revvity.celigo.celigo.LumeneraCamera", return_value=camera),
   ):
-    return Celigo(config=config, allow_laser=allow_laser)
+    return Celigo(config=config, allow_laser=allow_laser, camera_enabled=camera_enabled)

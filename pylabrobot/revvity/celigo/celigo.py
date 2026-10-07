@@ -311,6 +311,9 @@ class Celigo:
   (brightfield + fluorescence), galvo steering, and the board's digital/analog IO and
   barcode reader. Load an instrument's configuration with
   :meth:`CeligoConfig.from_install` and pass the result as ``config``.
+
+  Pass ``camera_enabled=False`` to drive motion, illumination, and galvos without a
+  camera: setup then skips the camera, and acquisition methods raise :class:`CeligoError`.
   """
 
   def __init__(
@@ -325,6 +328,7 @@ class Celigo:
     reply_timeout: float = 2.0,
     move_timeout: float = 30.0,
     lucam_sdk: Optional[str] = None,
+    camera_enabled: bool = True,
     allow_laser: bool = False,
     fluorescence_warmup_seconds: float = 300.0,
     fluorescence_power_change_interval: float = 10.0,
@@ -346,7 +350,9 @@ class Celigo:
     self.move_timeout = move_timeout
     self.config = config
     self._plate: Optional[Plate] = None
-    self.camera: CeligoCamera = LumeneraCamera(sdk_library=lucam_sdk)
+    self.camera: Optional[CeligoCamera] = (
+      LumeneraCamera(sdk_library=lucam_sdk) if camera_enabled else None
+    )
     self.galvo = Galvo(self)
     self.laser = Laser(self, enabled=allow_laser)
     self.fluorescence_warmup_seconds = fluorescence_warmup_seconds
@@ -553,7 +559,20 @@ class Celigo:
 
   # -- lifecycle -------------------------------------------------------------
 
-  async def setup(self) -> None:
+  async def _adopt_linear_axis_positions(self) -> None:
+    """Trust each linear axis's current encoder position instead of homing it."""
+    for axis in self._linear_axes.values():
+      await axis.assume_homed()
+
+  async def setup(self, home: bool = True) -> None:
+    """Connect, initialize motors and galvos, open the camera, and home the imaging axes.
+
+    Args:
+      home: Home Z, X, Y, and the dichroic filter. ``False`` instead adopts each linear
+        axis's current encoder position with :meth:`LinearAxis.assume_homed`. Use it only
+        when this software homed the axes since the motor controllers last powered up;
+        filter wheels are then unreferenced until homed.
+    """
     io_open = False
     try:
       await self.io.setup()
@@ -582,17 +601,22 @@ class Celigo:
       # Identity is required to choose the correct motor-tunnel framing safely.
       self.controller_info = await self.request_controller_info()
       await self._initialize_hardware()
-      await self.camera.setup()
-      await self._configure_camera_for_calibration()
-      await self.home_imaging_axes()
+      if self.camera is not None:
+        await self.camera.setup()
+        await self._configure_camera_for_calibration()
+      if home:
+        await self.home_imaging_axes()
+      else:
+        await self._adopt_linear_axis_positions()
     except BaseException:
       if io_open:
         with contextlib.suppress(Exception):
           await self.abort_controller_operation()
         with contextlib.suppress(Exception):
           await self._initialize_safe_outputs()
-      with contextlib.suppress(Exception):
-        await self.camera.stop()
+      if self.camera is not None:
+        with contextlib.suppress(Exception):
+          await self.camera.stop()
       if io_open:
         with contextlib.suppress(Exception):
           await self.io.stop()
@@ -614,7 +638,8 @@ class Celigo:
     if self._connected:
       await attempt(self.abort_controller_operation)
       await attempt(self._initialize_safe_outputs)
-    await attempt(self.camera.stop)
+    if self.camera is not None:
+      await attempt(self.camera.stop)
     await attempt(self.io.stop)
     self._connected = False
     if first_error is not None:
@@ -1331,11 +1356,18 @@ class Celigo:
 
   # -- autofocus -------------------------------------------------------------
 
+  def _require_camera(self) -> CeligoCamera:
+    """Return the camera, or raise when this instrument was constructed without one."""
+    if self.camera is None:
+      raise CeligoError("This Celigo was constructed with camera_enabled=False")
+    return self.camera
+
   def _validate_camera_geometry(self) -> None:
     """Reject a camera format that disagrees with the optical calibration geometry."""
     calibration = self.config.calibration
-    width = self.camera.width
-    height = self.camera.height
+    camera = self._require_camera()
+    width = camera.width
+    height = camera.height
     if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
       raise CeligoError("Camera must expose positive width and height for geometry validation")
     expected = (calibration.image_width_pixels, calibration.image_height_pixels)
@@ -1348,7 +1380,7 @@ class Celigo:
   async def _configure_camera_for_calibration(self) -> None:
     """Apply the calibrated image dimensions to cameras that support native ROI."""
     calibration = self.config.calibration
-    camera = self.camera
+    camera = self._require_camera()
     expected = (calibration.image_width_pixels, calibration.image_height_pixels)
     if (camera.width, camera.height) == expected:
       return
@@ -1381,7 +1413,7 @@ class Celigo:
     self,
     require_calibrated_geometry: bool = True,
   ) -> CeligoCamera:
-    camera = self.camera
+    camera = self._require_camera()
     if not camera.is_open:
       await camera.setup()
     if require_calibrated_geometry:

@@ -10,9 +10,12 @@ checked on hardware before the next one is attempted:
   seek     limit mode on, drive negative up to 25000 units; the MOTOR must stop itself
            at the home sensor
   backoff  move +HomingShortMove; the sensor must clear
-  index    encoder-index search (N<mode>Z<distance>): zeroes, drives back into the home
-           sensor with limits disabled, and zeroes again at the next encoder index
-  zero     move to the index zero, restore the motor mode, move to MinPosition
+  index    the driver's Z search toward home with limits disabled. Normal/Normal_Accurate
+           zero at the next encoder index; NormalWithHardstopCheck (N1, no index) must stop
+           and zero at the home-sensor edge
+  zero     move to the zero, restore the motor mode, move to MinPosition
+  far      positive move with limit mode on; the MOTOR must stop at the far sensor (bit 3).
+           For Y this requires X on its home sensor, where the door is.
 
 ``--driver-home`` instead runs init and then the real ``LinearAxis.home()`` in one call.
 
@@ -31,15 +34,25 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Dict, List, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 from controller import connect, disconnect, make_celigo
-from draft_config import y_axis_config
+from legacy_config import load_legacy_config
 
-from pylabrobot.revvity.celigo import Axis, CeligoError, LinearAxis
+from pylabrobot.revvity.celigo import (
+  Axis,
+  Celigo,
+  CeligoError,
+  LinearAxis,
+  LinearAxisConfig,
+  StepperMotor,
+)
 from pylabrobot.revvity.celigo.protocol import complete_cleanup
 
-STAGES = ("init", "units", "seek", "backoff", "index", "zero")
+STAGES = ("init", "units", "seek", "backoff", "index", "zero", "far")
+HOME_TYPES = ("Normal", "Normal_Accurate", "NormalWithHardstopCheck")
+SPECIAL_ENCODER_NO_INDEX = 1  # motion.py _EZ_SPECIAL_ENCODER_NO_INDEX
+X_AXIS_ADDRESS = 1
 HOME_SENSOR_BIT = 0x04  # opto 1, measured on X and Y
 FAR_SENSOR_BIT = 0x08  # opto 2, not yet mapped
 SEEK_DISTANCE = 25000  # the driver's fixed seek distance (motion.py LinearAxis.home)
@@ -73,12 +86,17 @@ class Watchdog:
     overtravel_ticks: Optional[int],
     units_per_tick: Optional[float],
     stall_tolerance_ticks: int,
+    max_travel_ticks: Optional[int] = None,
+    overtravel_bit: int = HOME_SENSOR_BIT,
   ) -> None:
     self.axis = axis
     self.stop_bits = stop_bits
     self.overtravel_ticks = overtravel_ticks
     self.units_per_tick = units_per_tick
     self.stall_tolerance_ticks = stall_tolerance_ticks
+    self.max_travel_ticks = max_travel_ticks
+    self.overtravel_bit = overtravel_bit
+    self.travelled_ticks = 0
     self.events: List[Dict[str, Any]] = []
     self.reason: Optional[str] = None
 
@@ -94,7 +112,7 @@ class Watchdog:
     flags = await self._read("?4")
     units0 = last_units = await self._read("?0")
     ticks0 = last_ticks = await self._read("?8")
-    sensor_edge_ticks = ticks0 if flags & HOME_SENSOR_BIT else None
+    sensor_edge_ticks = ticks0 if flags & self.overtravel_bit else None
     while True:
       with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(stop.wait(), POLL_INTERVAL)
@@ -113,6 +131,10 @@ class Watchdog:
         units0, ticks0 = units, ticks
         if sensor_edge_ticks is not None:
           sensor_edge_ticks += jump
+      else:
+        self.travelled_ticks += abs(jump)
+        if self.max_travel_ticks is not None and self.travelled_ticks > self.max_travel_ticks:
+          await self.trip(f"travelled {self.travelled_ticks} ticks, limit {self.max_travel_ticks}")
       last_units, last_ticks = units, ticks
       if current != flags:
         self.events.append(
@@ -121,11 +143,12 @@ class Watchdog:
             "from": flags,
             "to": current,
             "ticks": ticks,
+            "units": units,
           }
         )
-        if current & HOME_SENSOR_BIT and not flags & HOME_SENSOR_BIT:
+        if current & self.overtravel_bit and not flags & self.overtravel_bit:
           sensor_edge_ticks = ticks
-        elif not current & HOME_SENSOR_BIT:
+        elif not current & self.overtravel_bit:
           sensor_edge_ticks = None
         if (current ^ flags) & self.stop_bits:
           await self.trip(f"input flags changed {flags} -> {current} at {ticks} ticks")
@@ -137,11 +160,11 @@ class Watchdog:
       if (
         self.overtravel_ticks is not None
         and sensor_edge_ticks is not None
-        and current & HOME_SENSOR_BIT
+        and current & self.overtravel_bit
         and abs(ticks - sensor_edge_ticks) > self.overtravel_ticks
       ):
         await self.trip(
-          f"motor kept moving {abs(ticks - sensor_edge_ticks)} ticks past the home-sensor edge"
+          f"motor kept moving {abs(ticks - sensor_edge_ticks)} ticks past the sensor edge"
         )
       if self.units_per_tick:
         lag = abs((units - units0) / self.units_per_tick - (ticks - ticks0))
@@ -214,14 +237,24 @@ class Runner:
     self.homing_velocity = axis._rate_to_encoder_tick_rate(config.homing_velocity)
     self.index_velocity = axis._rate_to_encoder_tick_rate(config.index_velocity)
 
-  def watchdog(self, stop_bits: int, overtravel: Optional[int] = None) -> Watchdog:
+  def watchdog(
+    self,
+    stop_bits: int,
+    overtravel: Optional[int] = None,
+    overtravel_bit: int = HOME_SENSOR_BIT,
+  ) -> Watchdog:
     return Watchdog(
       self.axis,
       stop_bits=stop_bits,
       overtravel_ticks=overtravel,
       units_per_tick=self.units_per_tick,
       stall_tolerance_ticks=self.args.stall_tolerance,
+      overtravel_bit=overtravel_bit,
     )
+
+  @property
+  def uses_index(self) -> bool:
+    return not self.axis.config.home_type.startswith("NormalWithHardstopCheck")
 
   async def stage(self, name: str, operation) -> None:
     result: Dict[str, Any] = {"before": await read_state(self.axis)}
@@ -344,12 +377,20 @@ class Runner:
   async def index(self) -> Dict[str, Any]:
     await asyncio.sleep(0.05)
     config = self.axis.config
-    accurate = config.home_type == "Normal_Accurate" and self.axis._supports_accurate_encoder_index
-    special_mode = 6 if accurate else 2
-    search = config.homing_short_move * 2
-    # On this firmware Z zeroes the counters, drives back into the home sensor (limits are
-    # off), then stops and zeroes again at the next encoder index past the sensor edge.
-    watchdog = self.watchdog(FAR_SENSOR_BIT, INDEX_OVERTRAVEL)
+    if self.uses_index:
+      accurate = (
+        config.home_type == "Normal_Accurate" and self.axis._supports_accurate_encoder_index
+      )
+      special_mode = 6 if accurate else 2
+      search = config.homing_short_move * 2
+      # On this firmware Z zeroes the counters, drives back into the home sensor (limits are
+      # off), then stops and zeroes again at the next encoder index past the sensor edge.
+      watchdog = self.watchdog(FAR_SENSOR_BIT, INDEX_OVERTRAVEL)
+    else:
+      # As LinearAxis.home() for NormalWithHardstopCheck: no index; Z must stop at the edge.
+      special_mode = SPECIAL_ENCODER_NO_INDEX
+      search = SEEK_DISTANCE
+      watchdog = self.watchdog(FAR_SENSOR_BIT, self.args.overtravel)
     await guarded(
       self.axis._home_to_encoder_index(
         search,
@@ -363,6 +404,8 @@ class Runner:
     )
     state = await read_state(self.axis)
     details = {"special_mode": special_mode, "search_ticks": search, "events": watchdog.events}
+    if not self.uses_index and not await self.axis.request_limit_flags() & HOME_SENSOR_BIT:
+      raise CeligoError(f"Z ended off the home sensor (events: {watchdog.events})")
     if abs(state["units"]) > INDEX_ZERO_TOLERANCE:
       raise CeligoError(
         f"no encoder index found: Z ended at {state['units']} units instead of zeroing at an "
@@ -371,7 +414,7 @@ class Runner:
     return details
 
   async def zero(self) -> Dict[str, Any]:
-    # The index zero lies inside the home sensor, so only the far sensor stops these moves.
+    # The zero lies at or inside the home sensor, so only the far sensor stops these moves.
     watchdog = self.watchdog(FAR_SENSOR_BIT, INDEX_OVERTRAVEL)
     at_index = await guarded(
       Axis.move_to_ticks(self.axis, 0, velocity_ticks_per_second=self.max_velocity),
@@ -391,9 +434,35 @@ class Runner:
       "position_mm": await self.axis.request_position(),
     }
 
+  async def far(self) -> Dict[str, Any]:
+    """Not part of home(): confirm limit mode stops a positive move at the far sensor."""
+    if not self.axis.config.positive_limit:
+      raise CeligoError(f"axis {self.axis.name} has no far sensor configured")
+    if self.axis.name == "y":
+      x_flags = await _motor_input_flags(self.axis, X_AXIS_ADDRESS)
+      if not x_flags & HOME_SENSOR_BIT:
+        raise CeligoError("Y exits through the door only with X on its home sensor")
+    await self.axis.motor._set_mode(self.axis._motor_mode())
+    watchdog = self.watchdog(HOME_SENSOR_BIT, self.args.overtravel, overtravel_bit=FAR_SENSOR_BIT)
+    await guarded(
+      self.axis._move_homing_relative_ticks(True, SEEK_DISTANCE, self.max_velocity),
+      watchdog,
+      self.started_at,
+    )
+    if not await self.axis.request_limit_flags() & FAR_SENSOR_BIT:
+      raise CeligoError("motor stopped without the far sensor active")
+    return {
+      "sensor_events": watchdog.events,
+      "position_mm": await self.axis.request_position(),
+      "stopped_by_motor_limit_mode": True,
+    }
+
   async def driver_home(self) -> Dict[str, Any]:
-    # home() includes the index search, so allow its travel past the sensor edge.
-    watchdog = self.watchdog(FAR_SENSOR_BIT, INDEX_OVERTRAVEL)
+    # An index home travels past the sensor edge; a sensor-edge home must stop at it.
+    overtravel = INDEX_OVERTRAVEL if self.uses_index else self.args.overtravel
+    # An axis starting on its far sensor (e.g. Y out at the door) leaves it while homing.
+    on_far_sensor = bool(await self.axis.request_limit_flags() & FAR_SENSOR_BIT)
+    watchdog = self.watchdog(0 if on_far_sensor else FAR_SENSOR_BIT, overtravel)
     settled = await guarded(self.axis.home(), watchdog, self.started_at)
     return {
       "settled_ticks": settled,
@@ -402,8 +471,28 @@ class Runner:
     }
 
 
+async def _motor_input_flags(axis: Axis, address: int) -> int:
+  """Raw input flags of another motor on the same controller (a query, no motion)."""
+  response = await StepperMotor(axis._controller, address).send_command("?4", execute=False)
+  if not response.ok:
+    raise CeligoError(f"motor {address} ?4 failed (code {response.error_code})")
+  return int(response.response_text)
+
+
+def _axis_config(celigo: Celigo, axis: str) -> LinearAxisConfig:
+  configs: Dict[str, Optional[LinearAxisConfig]] = {
+    "x": celigo.config.hardware.x_axis,
+    "y": celigo.config.hardware.y_axis,
+    "z": celigo.config.hardware.z_axis,
+  }
+  config = configs[axis]
+  if config is None:
+    raise CeligoError(f"axis {axis} is not configured")
+  return config
+
+
 async def run(args: argparse.Namespace, report: Dict[str, Any]) -> None:
-  celigo = make_celigo(args.port, reply_timeout=args.reply_timeout)
+  celigo = make_celigo(args.port, config=load_legacy_config(), reply_timeout=args.reply_timeout)
   try:
     await connect(celigo)
   except CeligoError as exc:
@@ -412,18 +501,29 @@ async def run(args: argparse.Namespace, report: Dict[str, Any]) -> None:
   report["handshake"] = "ok"
   report["stages"] = {}
   try:
-    config = y_axis_config(args.home_type)
+    config = _axis_config(celigo, args.axis)
+    if args.home_type is not None:
+      config.home_type = args.home_type
+    report["home_type"] = config.home_type
     detected = {motor.motor_index for motor in await celigo.request_detected_motor_addresses()}
     if config.axis_index not in detected:
       raise CeligoError(f"motor {config.axis_index} was not detected")
     axis = LinearAxis(celigo.motor_controller, args.axis, config)
     runner = Runner(axis, args, report)
+    stages: Dict[str, Callable[[], Awaitable[Dict[str, Any]]]] = {
+      "units": runner.units,
+      "seek": runner.seek,
+      "backoff": runner.backoff,
+      "index": runner.index,
+      "zero": runner.zero,
+      "far": runner.far,
+    }
     await runner.stage("init", runner.init)
     if args.driver_home:
       await runner.stage("driver_home", runner.driver_home)
     else:
       for name in STAGES[1 : STAGES.index(args.through) + 1]:
-        await runner.stage(name, getattr(runner, name))
+        await runner.stage(name, stages[name])
   except (CeligoError, TimeoutError, ValueError) as exc:
     report["error"] = f"{type(exc).__name__}: {exc}"
   finally:
@@ -433,10 +533,8 @@ async def run(args: argparse.Namespace, report: Dict[str, Any]) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
   parser.add_argument("--port", required=True, help="controller COM port, e.g. COM4")
-  parser.add_argument("--axis", choices=("y",), default="y")
-  parser.add_argument(
-    "--home-type", choices=("Normal", "Normal_Accurate"), default="Normal_Accurate"
-  )
+  parser.add_argument("--axis", choices=("x", "y", "z"), default="y")
+  parser.add_argument("--home-type", choices=HOME_TYPES, help="override the configured HomeType")
   group = parser.add_mutually_exclusive_group(required=True)
   group.add_argument("--through", choices=STAGES, help="run stages up to and including this one")
   group.add_argument("--driver-home", action="store_true", help="init, then LinearAxis.home()")
@@ -472,7 +570,6 @@ def main(argv: Optional[List[str]] = None) -> int:
   report: Dict[str, Any] = {
     "port": args.port,
     "axis": args.axis,
-    "home_type": args.home_type,
     "through": label,
     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
   }
