@@ -314,6 +314,8 @@ class Celigo:
 
   Pass ``camera_enabled=False`` to drive motion, illumination, and galvos without a
   camera: setup then skips the camera, and acquisition methods raise :class:`CeligoError`.
+  Pass ``camera`` to use a :class:`CeligoCamera` other than the default Lumenera camera,
+  for example :class:`~pylabrobot.revvity.celigo.allied_vision_camera.AlliedVisionCamera`.
   """
 
   def __init__(
@@ -329,10 +331,13 @@ class Celigo:
     move_timeout: float = 30.0,
     lucam_sdk: Optional[str] = None,
     camera_enabled: bool = True,
+    camera: Optional[CeligoCamera] = None,
     allow_laser: bool = False,
     fluorescence_warmup_seconds: float = 300.0,
     fluorescence_power_change_interval: float = 10.0,
   ):
+    if camera is not None and not camera_enabled:
+      raise ValueError("camera cannot be passed with camera_enabled=False")
     if not math.isfinite(reply_timeout) or reply_timeout <= 0:
       raise ValueError("reply_timeout must be a finite, positive number of seconds")
     if not math.isfinite(move_timeout) or move_timeout <= 0:
@@ -350,9 +355,9 @@ class Celigo:
     self.move_timeout = move_timeout
     self.config = config
     self._plate: Optional[Plate] = None
-    self.camera: Optional[CeligoCamera] = (
-      LumeneraCamera(sdk_library=lucam_sdk) if camera_enabled else None
-    )
+    if camera is None and camera_enabled:
+      camera = LumeneraCamera(sdk_library=lucam_sdk)
+    self.camera: Optional[CeligoCamera] = camera
     self.galvo = Galvo(self)
     self.laser = Laser(self, enabled=allow_laser)
     self.fluorescence_warmup_seconds = fluorescence_warmup_seconds
@@ -1374,7 +1379,7 @@ class Celigo:
     if (width, height) != expected:
       raise CeligoError(
         f"Camera format {width}x{height} does not match calibrated image geometry "
-        f"{expected[0]}x{expected[1]}; configure the Lumenera ROI before acquisition"
+        f"{expected[0]}x{expected[1]}; configure the camera ROI before acquisition"
       )
 
   async def _configure_camera_for_calibration(self) -> None:

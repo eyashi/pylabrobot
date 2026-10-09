@@ -508,6 +508,19 @@ class TestCompanionConfigurationLoading(unittest.TestCase):
     assert isinstance(camera, FakeCamera)
     self.assertEqual(camera.sdk_library, "/opt/lumenera/liblucamapi.so")
 
+  def test_constructor_uses_a_supplied_camera(self):
+    camera = FakeCamera()
+    with (
+      patch("pylabrobot.revvity.celigo.celigo.FTDI"),
+      patch("pylabrobot.revvity.celigo.celigo.LumeneraCamera") as lumenera,
+    ):
+      celigo = Celigo(config=make_test_config(), camera=camera)
+      with self.assertRaisesRegex(ValueError, "camera_enabled=False"):
+        Celigo(config=make_test_config(), camera=camera, camera_enabled=False)
+
+    self.assertIs(celigo.camera, camera)
+    lumenera.assert_not_called()
+
   def test_constructor_requires_an_explicit_aggregate_config(self):
     with self.assertRaisesRegex(TypeError, "config"):
       inspect.signature(Celigo).bind()

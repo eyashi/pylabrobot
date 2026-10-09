@@ -163,6 +163,7 @@ Recommendations; none of this is built yet:
 | `illumination_test.py`, `brightfield_test.py` | Analog-output and driver-path brightfield tests | Light only |
 | `door_demo.py` | Full flow: home, open, wait, close | Yes |
 | `door_cycle.py` | Same, but skips homing when the axes are still homed | Yes |
+| `camera_probe.py` | Allied Vision camera bring-up (`info`, `capture`, `roi`); see `CAMERA_HANDOFF.md` | Camera only |
 | `legacy_config.py`, `config/` | The instrument configuration | — |
 
 Tests: `.venv\Scripts\python -m pytest tools/celigo_legacy pylabrobot/revvity/celigo`
@@ -171,6 +172,8 @@ Tests: `.venv\Scripts\python -m pytest tools/celigo_legacy pylabrobot/revvity/ce
 repository suite; it is large and not needed.
 
 ## Future work: imaging
+
+Camera bring-up on the FireWire PC: follow [`CAMERA_HANDOFF.md`](CAMERA_HANDOFF.md).
 
 The camera interface board was pending, and this unit's camera **is not** the Lumenera
 the driver supports. In order:
